@@ -50,6 +50,21 @@
 #include <setjmp.h>
 #endif
 
+#if (defined(__LINUX__) || defined(__ANDROID__)) && defined(__ARM_ARCH)
+/*#include <asm/hwcap.h>*/
+#ifndef AT_HWCAP
+#define AT_HWCAP 16
+#endif
+#ifndef HWCAP_NEON
+#define HWCAP_NEON (1 << 12)
+#endif
+#if defined HAVE_GETAUXVAL
+#include <sys/auxv.h>
+#else
+#include <fcntl.h>
+#endif
+#endif
+
 #define CPU_HAS_RDTSC   0x00000001
 #define CPU_HAS_ALTIVEC 0x00000002
 #define CPU_HAS_MMX     0x00000004
@@ -61,6 +76,8 @@
 #define CPU_HAS_SSE42   0x00000200
 #define CPU_HAS_AVX     0x00000400
 #define CPU_HAS_AVX2    0x00000800
+#define CPU_HAS_NEON    0x00001000
+#define CPU_HAS_ARM_SIMD 0x00002000
 
 #if SDL_ALTIVEC_BLITTERS && HAVE_SETJMP && !__MACOSX__ && !__OpenBSD__
 /* This is the brute force way of detecting instruction sets...
@@ -297,6 +314,118 @@ CPU_haveAltiVec(void)
 #endif
 #endif
     return altivec;
+}
+
+#ifdef __linux__
+
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <elf.h>
+
+static SDL_bool
+CPU_haveARMSIMD(void)
+{
+    int arm_simd = 0;
+    int fd;
+
+    fd = open("/proc/self/auxv", O_RDONLY);
+    if (fd >= 0)
+    {
+        Elf32_auxv_t aux;
+        while (read(fd, &aux, sizeof aux) == sizeof aux)
+        {
+            if (aux.a_type == AT_PLATFORM)
+            {
+                const char *plat = (const char *) aux.a_un.a_val;
+                arm_simd = strncmp(plat, "v6l", 3) == 0 ||
+                           strncmp(plat, "v7l", 3) == 0;
+            }
+        }
+        close(fd);
+    }
+    return arm_simd;
+}
+
+#else
+
+static SDL_bool
+CPU_haveARMSIMD(void)
+{
+#warning SDL_HasARMSIMD is not implemented for this ARM platform. Write me.
+    return 0;
+}
+
+#endif
+
+#if (defined(__LINUX__) || defined(__ANDROID__)) && defined(__ARM_ARCH) && !defined(HAVE_GETAUXVAL)
+static int
+readProcAuxvForNeon(void)
+{
+    int neon = 0;
+    int kv[2];
+    const int fd = open("/proc/self/auxv", O_RDONLY);
+    if (fd != -1) {
+        while (read(fd, kv, sizeof (kv)) == sizeof (kv)) {
+            if (kv[0] == AT_HWCAP) {
+                neon = ((kv[1] & HWCAP_NEON) == HWCAP_NEON);
+                break;
+            }
+        }
+        close(fd);
+    }
+    return neon;
+}
+#endif
+
+
+static int
+CPU_haveNEON(void)
+{
+/* The way you detect NEON is a privileged instruction on ARM, so you have
+   query the OS kernel in a platform-specific way. :/ */
+#if defined(SDL_CPUINFO_DISABLED)
+   return 0; /* disabled */
+#elif (defined(__WINDOWS__) || defined(__WINRT__)) && (defined(_M_ARM) || defined(_M_ARM64))
+/* Visual Studio, for ARM, doesn't define __ARM_ARCH. Handle this first. */
+/* Seems to have been removed */
+#  if !defined(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE)
+#    define PF_ARM_NEON_INSTRUCTIONS_AVAILABLE 19
+#  endif
+/* All WinRT ARM devices are required to support NEON, but just in case. */
+    return IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE) != 0;
+#elif !defined(__ARM_ARCH)
+    return 0;  /* not an ARM CPU at all. */
+#elif __ARM_ARCH >= 8
+    return 1;  /* ARMv8 always has non-optional NEON support. */
+#elif defined(__APPLE__) && (__ARM_ARCH >= 7)
+    /* (note that sysctlbyname("hw.optional.neon") doesn't work!) */
+    return 1;  /* all Apple ARMv7 chips and later have NEON. */
+#elif defined(__APPLE__)
+    return 0;  /* assume anything else from Apple doesn't have NEON. */
+#elif defined(__QNXNTO__)
+    return SYSPAGE_ENTRY(cpuinfo)->flags & ARM_CPU_FLAG_NEON;
+#elif (defined(__LINUX__) || defined(__ANDROID__)) && defined(HAVE_GETAUXVAL)
+    return ((getauxval(AT_HWCAP) & HWCAP_NEON) == HWCAP_NEON);
+#elif defined(__LINUX__)
+    return readProcAuxvForNeon();
+#elif defined(__ANDROID__)
+    /* Use NDK cpufeatures to read either /proc/self/auxv or /proc/cpuinfo */
+    {
+        AndroidCpuFamily cpu_family = android_getCpuFamily();
+        if (cpu_family == ANDROID_CPU_FAMILY_ARM) {
+            uint64_t cpu_features = android_getCpuFeatures();
+            if ((cpu_features & ANDROID_CPU_ARM_FEATURE_NEON) != 0) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+#else
+#warning SDL_HasNEON is not implemented for this ARM platform. Write me.
+    return 0;
+#endif
 }
 
 static int
@@ -618,6 +747,12 @@ SDL_GetCPUFeatures(void)
         if (CPU_haveAVX2()) {
             SDL_CPUFeatures |= CPU_HAS_AVX2;
         }
+        if (CPU_haveARMSIMD()) {
+            SDL_CPUFeatures |= CPU_HAS_ARM_SIMD;
+        }
+        if (CPU_haveNEON()) {
+            SDL_CPUFeatures |= CPU_HAS_NEON;
+        }
     }
     return SDL_CPUFeatures;
 }
@@ -721,6 +856,24 @@ SDL_HasAVX2(void)
     return SDL_FALSE;
 }
 
+SDL_bool
+SDL_HasARMSIMD(void)
+{
+    if (SDL_GetCPUFeatures() & CPU_HAS_ARM_SIMD) {
+        return SDL_TRUE;
+    }
+    return SDL_FALSE;
+}
+
+SDL_bool
+SDL_HasNEON(void)
+{
+    if (SDL_GetCPUFeatures() & CPU_HAS_NEON) {
+        return SDL_TRUE;
+    }
+    return SDL_FALSE;
+}
+
 static int SDL_SystemRAM = 0;
 
 int
@@ -790,6 +943,8 @@ main()
     printf("SSE4.2: %d\n", SDL_HasSSE42());
     printf("AVX: %d\n", SDL_HasAVX());
     printf("AVX2: %d\n", SDL_HasAVX2());
+    printf("ARM SIMD: %d\n", SDL_HasARMSIMD());
+    printf("NEON: %d\n", SDL_HasNEON());
     printf("RAM: %d MB\n", SDL_GetSystemRAM());
     return 0;
 }
